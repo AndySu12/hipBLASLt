@@ -1950,6 +1950,7 @@ namespace Tensile
 
                 virtual bool operator()(ContractionProblemGemm const& problem) const override
                 {
+                    return true;
                     return problem.useGradient() == value;
                 }
 
