@@ -1936,7 +1936,7 @@ Tests:
     - *bf8_precision_dst_bf16
     - *bf8_precision_dst_fp32
   matrix_size:
-    - { M:  117760, N:  117760, K:  4096 }
+    - { M:  11776, N:  11776, K:  4096 }
   transA: N
   transB: T
   alpha: [1.0, 2.0]
@@ -1953,7 +1953,7 @@ Tests:
   function:
     matmul: *double_precision
   matrix_size:
-    - { M:  117760, N:  117760, K:  4096 }
+    - { M:  11776, N:  11776, K:  4096 }
   transA: N
   transB: T
   alpha: [1.0, 2.0]
