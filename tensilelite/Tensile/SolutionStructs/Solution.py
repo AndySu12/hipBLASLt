@@ -1303,10 +1303,6 @@ class Solution(collections.abc.Mapping):
     if state["enableLDSTrB"]:
       state["VectorWidthB"] = 1
 
-    if state["LDSTrInst"] and state["1LDSBuffer"] == 0:
-      reject(state, "Current LDS Transpose implementation does not support two LDS buffers")
-      return
-
     # if state["EnableMatrixInstruction"] and not state["SourceSwap"] and (state["VectorWidthA"] > 1 or state["VectorWidthB"] > 1):
     #   reject(state, printRejectionReason, "not implement VectorWidth without SourceSwap")
 
@@ -2231,32 +2227,34 @@ class Solution(collections.abc.Mapping):
 
       # Try to enlarge GLVW for metadata
       bGlobalReadVectorWidthMetadata = state["GlobalReadVectorWidthMetadata"]
-      if state["ProblemType"]["Sparse"] == 2:
-        GlobalReadVectorWidth = min(state["GlobalReadVectorWidthMetadata"] * state["NumLoadsPerpendicularB"], depthUM) #sum all need read
-        tvm = totalElementsM // GlobalReadVectorWidth
-        if not Solution.setGlobalReadVectorWidth(state, "Metadata", tvm, GlobalReadVectorWidth, printRejectionReason):
-          #fallback
-          tvm = totalElementsM // bGlobalReadVectorWidthMetadata
-          Solution.setGlobalReadVectorWidth(state, "Metadata", tvm, bGlobalReadVectorWidthMetadata, printRejectionReason)
+      glvwMlimit = 16
+      if state["GlobalReadVectorWidthMetadata"] < glvwMlimit:
+        if state["ProblemType"]["Sparse"] == 2:
+          GlobalReadVectorWidth = min(state["GlobalReadVectorWidthMetadata"] * state["NumLoadsPerpendicularB"], depthUM, glvwMlimit) #sum all need read
+          tvm = totalElementsM // GlobalReadVectorWidth
+          if not Solution.setGlobalReadVectorWidth(state, "Metadata", tvm, GlobalReadVectorWidth, printRejectionReason):
+            #fallback
+            tvm = totalElementsM // bGlobalReadVectorWidthMetadata
+            Solution.setGlobalReadVectorWidth(state, "Metadata", tvm, bGlobalReadVectorWidthMetadata, printRejectionReason)
 
-        GlobalReadVectorWidthMetadata = state["GlobalReadVectorWidthMetadata"]
-        if GlobalReadVectorWidthMetadata == 0:
-          GlobalReadVectorWidthMetadata = 1
-        totalVectorsCoalescedM = totalElementsCoalescedM // GlobalReadVectorWidthMetadata
-        totalVectorsM = totalElementsM // GlobalReadVectorWidthMetadata
-      else:
-        GlobalReadVectorWidth = min(state["GlobalReadVectorWidthMetadata"] * state["NumLoadsPerpendicularA"], depthUM) #sum all need read
-        tvm = totalElementsM // GlobalReadVectorWidth
-        if not Solution.setGlobalReadVectorWidth(state, "Metadata", tvm, GlobalReadVectorWidth, printRejectionReason):
-          #fallback
-          tvm = totalElementsM // bGlobalReadVectorWidthMetadata
-          Solution.setGlobalReadVectorWidth(state, "Metadata", tvm, bGlobalReadVectorWidthMetadata, printRejectionReason)
+          GlobalReadVectorWidthMetadata = state["GlobalReadVectorWidthMetadata"]
+          if GlobalReadVectorWidthMetadata == 0:
+            GlobalReadVectorWidthMetadata = 1
+          totalVectorsCoalescedM = totalElementsCoalescedM // GlobalReadVectorWidthMetadata
+          totalVectorsM = totalElementsM // GlobalReadVectorWidthMetadata
+        else:
+          GlobalReadVectorWidth = min(state["GlobalReadVectorWidthMetadata"] * state["NumLoadsPerpendicularA"], depthUM, glvwMlimit) #sum all need read
+          tvm = totalElementsM // GlobalReadVectorWidth
+          if not Solution.setGlobalReadVectorWidth(state, "Metadata", tvm, GlobalReadVectorWidth, printRejectionReason):
+            #fallback
+            tvm = totalElementsM // bGlobalReadVectorWidthMetadata
+            Solution.setGlobalReadVectorWidth(state, "Metadata", tvm, bGlobalReadVectorWidthMetadata, printRejectionReason)
 
-        GlobalReadVectorWidthMetadata = state["GlobalReadVectorWidthMetadata"]
-        if GlobalReadVectorWidthMetadata == 0:
-          GlobalReadVectorWidthMetadata = 1
-        totalVectorsCoalescedM = totalElementsCoalescedM // GlobalReadVectorWidthMetadata
-        totalVectorsM = totalElementsM // GlobalReadVectorWidthMetadata
+          GlobalReadVectorWidthMetadata = state["GlobalReadVectorWidthMetadata"]
+          if GlobalReadVectorWidthMetadata == 0:
+            GlobalReadVectorWidthMetadata = 1
+          totalVectorsCoalescedM = totalElementsCoalescedM // GlobalReadVectorWidthMetadata
+          totalVectorsM = totalElementsM // GlobalReadVectorWidthMetadata
 
       if not Solution.setGlobalLoadTileDimClassic(state, "Metadata", state["NumLoadsMetadata"], \
           totalVectorsCoalescedM, totalElementsPerpM, depthUM, printRejectionReason):
@@ -3216,8 +3214,6 @@ class Solution(collections.abc.Mapping):
         reject(state, printRejectionReason, "MultipleBufferSingleKernel not support BiasSrc not D yet")
       if state["ProblemType"]["DataType"].isDouble():
         reject(state, printRejectionReason, "MultipleBufferSingleKernel not support " + str(state["ProblemType"]["DataType"])  + " yet")
-      if state["ProblemType"]["Sparse"] != 0:
-        reject(state, printRejectionReason, "MultipleBufferSingleKernel not support sparse yet")
 
     #Need to force disabling PreloadKernArgs if compiler does not support
     #Can not just reject the solution since the user library may find any solutions

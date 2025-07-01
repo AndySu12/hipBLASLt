@@ -154,6 +154,8 @@ namespace TensileLite
         int CUOccupancy            = 0;
         int PrefetchGlobalRead     = 2;
         int MathClocksUnrolledLoop = 0;
+
+        size_t synchronizerSizePerWG = 0;
     };
 
     /**
@@ -201,6 +203,7 @@ namespace TensileLite
         {
             return kernelName;
         }
+        virtual bool isFallbackForHW(Hardware const&) const;
 
         bool isStreamK() const
         {
@@ -285,6 +288,8 @@ namespace TensileLite
                                                 Hardware const&             hardware) const;
         size_t requiredHostSizeGroupedGemmSingle(Problem const&  problem,
                                                  Hardware const& hardware) const;
+
+        size_t requiredSynchronizerSize(Problem const& problem, Hardware const& hardware) const;                                         
 
         size_t getSKGrid(Problem const& problem, Hardware const& hardware, size_t tiles) const;
         size_t partialTileSize(size_t skGrid) const;
@@ -391,7 +396,8 @@ namespace TensileLite
                         KA&                                 args,
                         uint32_t                            numWorkGroups,
                         Hardware const*                     hardware,
-                        const ContractionProblemParameters& param) const;
+                        const ContractionProblemParameters& param,
+                        int32_t                             defaultWGM) const;
 
         template <typename KA>
         inline void calculateSingleCallWorkGroupItems(std::vector<Problem> const& problems,
@@ -530,8 +536,10 @@ namespace TensileLite
         std::string                  kernelName;
         std::string                  solutionName;
         ThreadSafeValue<std::string> codeObjectFilename;
-        bool                         debugKernel   = false;
-        bool                         kernelArgsLog = false;
+        bool                         debugKernel     = false;
+        bool                         kernelArgsLog   = false;
+        mutable int                  isFallbackCUSol = -1; // -1:unset, 0:false, 1:true
+
         std::shared_ptr<Predicates::Predicate<Task>> taskPredicate
             = std::make_shared<Predicates::True<Task>>();
         std::shared_ptr<Predicates::Predicate<Problem>> problemPredicate

@@ -23,7 +23,7 @@
 ################################################################################
 
 
-from rocisa import countInstruction, countGlobalRead, countSMemLoad
+from rocisa import countInstruction, countGlobalRead, countSMemLoad, findInstCount
 from rocisa.asmpass import getActFuncModuleName, getActFuncBranchModuleName
 from rocisa.code import KernelBody, Label, Macro, Module, RegSet, SrdUpperValue, \
                         StructuredModule, TextBlock, ValueEndif, ValueIf, ValueSet, SignatureBase
@@ -87,6 +87,7 @@ from Tensile.Toolchain.Component import Assembler
 from math import ceil, log
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import List, NamedTuple, Optional, Tuple, Union
 
 import os
@@ -158,9 +159,6 @@ class KernelWriterAssembly(KernelWriter):
       code = ""
       errcode = -2
     return (errcode, code)
-
-  def getSgprOccupancy(self, sgprs):
-    return self.states.regCaps["PhysicalMaxSgpr"]//sgprs
 
   def getSgprOccupancy(self, sgprs):
     return self.states.regCaps["PhysicalMaxSgpr"]//sgprs
@@ -466,7 +464,7 @@ class KernelWriterAssembly(KernelWriter):
   def defineSgprIdx(self, name, numSgprs, align=1):
     if numSgprs == 0: return
 
-    sgprIdx = self.sgprPool.checkOutAligned(numSgprs, align, tag=name, preventOverflow=0)
+    sgprIdx = self.sgprPool.checkOutAligned(numSgprs, align, tag=name, preventOverflow=False)
     #self.sgprIdx = roundUpToNearestMultiple(self.sgprIdx,align)
     #print (name, "->", self.sgprIdx, "+", numSgprs)
     self.sgprs[name] = sgprIdx
@@ -556,7 +554,7 @@ class KernelWriterAssembly(KernelWriter):
         needPackK8Lw = True
       if self.states.lrvwTileA > 2 or self.states.lrvwTileB > 2 or self.states.lrvwTileMetadata > 2:
         needPackK8Hi = True
-    
+
     # need extra sgpr for packing metadata
     tPackM = "M" if needPackK16 and needPackK8Lw else ""
 
@@ -1620,25 +1618,25 @@ class KernelWriterAssembly(KernelWriter):
     if self.do["PreLoop"]:
       ### temp sgpr for groupedgemm ###
       # can be start from sgpr_preload_end
-      sgprNumsOfGemm = self.sgprPool.checkOut(1, preventOverflow=0)
+      sgprNumsOfGemm = self.sgprPool.checkOut(1, preventOverflow=False)
 
       self.kernArgOffset = 0
       self.argLoader = ArgumentLoader()
       self.externalArgLoader = ArgumentLoader()
       ########################################
       # Common parameters
-      sgprArgType = self.sgprPool.checkOut(1, preventOverflow=0)
+      sgprArgType = self.sgprPool.checkOut(1, preventOverflow=False)
       commonArgs = Module("load arguments")
       commonArgs.addComment1("Load num of Gemms")
       commonArgs.add(self.argLoader.loadKernArg(sgprNumsOfGemm, "KernArgAddress", 0, dword=1))
 
-      sgprPackedArgs = self.sgprPool.checkOut(1, preventOverflow=0)
+      sgprPackedArgs = self.sgprPool.checkOut(1, preventOverflow=False)
       # Load combined internal arguments
       commonArgs.addComment1("Load packed kernel args (StaggerU/GSU)")
       commonArgs.add(self.argLoader.loadKernArg(sgprPackedArgs, "KernArgAddress", 4, dword=1))
       commonArgs.addComment1("Load WGM data")
       commonArgs.add(self.argLoader.loadKernArg("WGM", "KernArgAddress", 8, dword=1))
-      tmpSgprNumWorkGroups = self.sgprPool.checkOut(1, preventOverflow=0)
+      tmpSgprNumWorkGroups = self.sgprPool.checkOut(1, preventOverflow=False)
       commonArgs.addComment1("Load num of WGs")
       commonArgs.add(self.argLoader.loadKernArg(tmpSgprNumWorkGroups, "KernArgAddress", 12, dword=1))
       ########################################
@@ -4763,12 +4761,13 @@ class KernelWriterAssembly(KernelWriter):
     tagList = ["AddressA", "AddressB", "WrapUA", "WrapUB", "StaggerU", "WGM", \
                "StaggerUIter", "GlobalReadIncsA", "GlobalReadIncsB"]
     lastRegTag = None
+    spool = self.sgprPool.getPool()
     for i in range(0, self.sgprPool.size()):
-      regTag = self.sgprPool.pool[i].tag
+      regTag = spool[i].tag
       if regTag != lastRegTag:
         lastRegTag = regTag
         if (lastRegTag not in self.states.nonPostLoopSgpr) and \
-           (self.sgprPool.pool[i].status == RegisterPool.Status.InUse) and \
+           (spool[i].status == RegisterPool.Status.InUse) and \
            (lastRegTag in tagList):
           imod.add(self.undefineSgpr(regTag))
 
@@ -5827,11 +5826,12 @@ class KernelWriterAssembly(KernelWriter):
 
     lastRegTag=None
 
+    spool = self.sgprPool.getPool()
     for i in range(0, self.sgprPool.size()):
-      regTag = self.sgprPool.pool[i].tag
+      regTag = spool[i].tag
       if regTag != lastRegTag:
         lastRegTag = regTag
-        if (lastRegTag not in self.states.nonPostLoopSgpr) and (self.sgprPool.pool[i].status == RegisterPool.Status.InUse):
+        if (lastRegTag not in self.states.nonPostLoopSgpr) and (spool[i].status == RegisterPool.Status.InUse):
           if label == "Summation_End_OptNLL":
             self.undefineSgpr(regTag)
           else:
@@ -6410,12 +6410,25 @@ class KernelWriterAssembly(KernelWriter):
             if numTmpSgpr == 4:
                tmpSgprX3 = tmpSgprInfo.idx+3
 
-          sparseInputBlocksA = 1
-          sparseInputBlocksB = 1
-          if kernel["MIInputPerThread"] * kernel["ProblemType"]["DataTypeB"].numBytes() > 16 :
-            sparseInputBlocksA = 2 if kernel["ProblemType"]["Sparse"] == 2 else 1
-            sparseInputBlocksB = 2 if kernel["ProblemType"]["Sparse"] == 1 else 1
+          def findSparseOffset(isA:bool):
+            blocksPerTGroupSMFMA = 1
+            elementsPerBlockSMFMA = 1
+            blockOffsetSMFMA =1
+            if kernel["ProblemType"]["Sparse"] != 0:
+                if kernel["MIInputPerThread"] * kernel["ProblemType"]["DataTypeB"].numBytes() > 16: # double K
+                    isSparseTrack = (kernel["ProblemType"]["Sparse"] == 1 and isA) or (kernel["ProblemType"]["Sparse"] == 2 and not isA)
+                    # gfx950 sparse track only has one block for each thread group.
+                    # TODO adjust this value for other arch.
+                    blocksPerTGroupSMFMA = 1 if isSparseTrack else 2
+                    if blocksPerTGroupSMFMA > 1:
+                        threadGroups = kernel["MatrixInstK"] // kernel["MIInputPerThread"]
+                        elementsPerBlockSMFMA = kernel["MIInputPerThread"] // blocksPerTGroupSMFMA
+                        blockStride = elementsPerBlockSMFMA * threadGroups
+                        blockOffsetSMFMA = blockStride - elementsPerBlockSMFMA
+            return blocksPerTGroupSMFMA, elementsPerBlockSMFMA, blockOffsetSMFMA
 
+          blocksPerTGroupSMFMAA, elementsPerBlockSMFMAA, blockOffsetSMFMAA = findSparseOffset(True)
+          blocksPerTGroupSMFMAB, elementsPerBlockSMFMAB, blockOffsetSMFMAB = findSparseOffset(False)
           # replace 0 for differnet thread
           if kernel["ProblemType"]["Sparse"] == 1 and numMIInput//8 >= 1:
             vgprPerSet0Group = 1
@@ -6436,16 +6449,15 @@ class KernelWriterAssembly(KernelWriter):
           for group in range(0, numSet0GroupA):
             if numSet0GroupA > 1 or (is_wmma_v2 and vgprPerInputA > 2):
               if group == 0:
-                if kernel["ProblemType"]["Sparse"] == 1:
-                    multiplyBy = numMIInput//sparseInputBlocksA
+                if kernel["ProblemType"]["Sparse"]:
+                    multiplyBy = numMIInput//blocksPerTGroupSMFMAA
                 else:
                     multiplyBy = numMIInput//2 if vgprPerInputA == 8 else numMIInput
                 shiftK.add(vectorStaticMultiply(vgpr(kReg_first), vgpr(kReg_first), multiplyBy, tmpSgprInfo))
                 shiftK.add(VAddU32(vgpr(kReg), vgpr(kReg_first), 0, ""))
-              elif kernel["ProblemType"]["Sparse"] == 2 and group == 2 and sparseInputBlocksA == 2:
-                is8bits = kernel["ProblemType"]["DataType"].numBytes() == 1
-                strideK = 3 if kernel["MatrixInstK"]== 32 or (is8bits and kernel["MatrixInstK"]== 64) else 7
-                shiftK.add(VAddU32(vgpr(kReg), vgpr(kReg), numMIInput//numSet0GroupA*strideK, "add part of K"))
+              elif blocksPerTGroupSMFMAA == 2 and (group * vgprPerSet0Group) == (elementsPerBlockSMFMAA * numRegistersIn):
+                kIncA = blockOffsetSMFMAA + (numMIInput//numSet0GroupA) * max(group - 1, 0)
+                shiftK.add(VAddU32(vgpr(kReg), vgpr(kReg), kIncA, "add part of K"))
               else:
                 kIncA = numMIInput//numSet0GroupA
                 if self.states.asmCaps["HasMFMA_f8f6f4"]:
@@ -6482,16 +6494,15 @@ class KernelWriterAssembly(KernelWriter):
           for group in range(0, numSet0GroupB):
             if numSet0GroupB > 1 or (is_wmma_v2 and vgprPerInputB > 2):
               if group == 0:
-                if kernel["ProblemType"]["Sparse"] == 1:
-                    multiplyBy = numMIInput//sparseInputBlocksB
+                if kernel["ProblemType"]["Sparse"]:
+                    multiplyBy = numMIInput//blocksPerTGroupSMFMAB
                 else:
                     multiplyBy = numMIInput//2 if vgprPerInputB == 8 else numMIInput
                 shiftK.add(vectorStaticMultiply(vgpr(kReg_first), vgpr(kReg_first), multiplyBy, tmpSgprInfo))
                 shiftK.add(VAddU32(vgpr(kReg), vgpr(kReg_first), 0, ""))
-              elif kernel["ProblemType"]["Sparse"] == 1 and group == 2 and sparseInputBlocksB == 2:
-                is8bits = kernel["ProblemType"]["DataType"].numBytes() == 1
-                strideK = 3 if kernel["MatrixInstK"]== 32 or (is8bits and kernel["MatrixInstK"]== 64) else 7
-                shiftK.add(VAddU32(vgpr(kReg), vgpr(kReg), numMIInput//numSet0GroupB*strideK, "add part of K"))
+              elif blocksPerTGroupSMFMAB == 2 and (group * vgprPerSet0Group) == (elementsPerBlockSMFMAB * numRegistersIn):
+                kIncB = blockOffsetSMFMAB + (numMIInput//numSet0GroupB) * max(group - 1, 0)
+                shiftK.add(VAddU32(vgpr(kReg), vgpr(kReg), kIncB, "add part of K"))
               else:
                 kIncB = numMIInput//numSet0GroupB
                 if group == 2 and vgprPerInputB == 8:
@@ -7181,27 +7192,17 @@ class KernelWriterAssembly(KernelWriter):
             module.add(Label("PrefetchGlobalLastIterEnd", ""))
 
     # swap back vgpr pool if any
-    if self.savedVgprPool != None and (not isNotLast):
-      # in case pool size in current path is larger than pool size in main path
-      # and it will miss allocate vgpr since allocating vgpr is based on pool size in main path
-      oldSize = self.savedVgprPool.size()
-      newSize = self.vgprPool.size()
-      if newSize > self.savedVgprPool.size():
-        for i in range(oldSize,newSize):
-          self.savedVgprPool.pool.append(self.savedVgprPool.Register(RegisterPool.Status.Available,"restore vgprPool"))
-      self.vgprPool = self.savedVgprPool # restore vgprPool before alternate path
-      self.savedVgprPool = None
-    # swap back sgpr pool if any
-    if self.savedSgprPool != None and (not isNotLast):
-      # in case pool size in current path is larger than pool size in main path
-      # and it will miss allocate vgpr since allocating vgpr is based on pool size in main path
-      oldSize = self.savedSgprPool.size()
-      newSize = self.sgprPool.size()
-      if newSize > self.savedSgprPool.size():
-        for i in range(oldSize-1,newSize):
-          self.savedSgprPool.pool.append(self.savedSgprPool.Register(RegisterPool.Status.Available,"restore sgprPool"))
-      self.sgprPool = self.savedSgprPool # restore vgprPool before alternate path
-      self.savedSgprPool = None
+    def swapBackGprPool(gprPool, savedGprPool, isNotLast):
+      if savedGprPool != None and (not isNotLast):
+        # in case pool size in current path is larger than pool size in main path
+        # and it will miss allocate vgpr since allocating vgpr is based on pool size in main path
+        newSize = gprPool.size()
+        savedGprPool.appendPool(newSize)
+        return savedGprPool, None # restore vgprPool before alternate path
+      return gprPool, savedGprPool
+
+    self.vgprPool, self.savedVgprPool = swapBackGprPool(self.vgprPool, self.savedVgprPool, isNotLast)
+    self.sgprPool, self.savedSgprPool = swapBackGprPool(self.sgprPool, self.savedSgprPool, isNotLast)
     return module
 
   ##############################################################################
@@ -8508,12 +8509,17 @@ class KernelWriterAssembly(KernelWriter):
           src1=sgpr("LocalWriteAddr%s"%tc), \
           comment="swap Red Blk SGPR"))
       else:
-        for i in range(0,numLwa):
-          module.add(VXorB32(
-            dst=vgpr("LocalWriteAddr%s+%u"%(tc,i)), \
+        module.add(VXorB32(
+            dst=vgpr("LocalWriteAddr%s"%tc), \
             src0=src0Val, \
-            src1=vgpr("LocalWriteAddr%s+%u"%(tc,i)), \
+            src1=vgpr("LocalWriteAddr%s"%tc), \
             comment="swap Red Blk"))
+        for i in range(1,numLwa):
+          module.add(VAddU32(
+            dst=vgpr("LocalWriteAddr%s+%u"%(tc,i)), \
+            src0=(i * self.states.regCaps["maxLDSConstOffset"]), \
+            src1=vgpr("LocalWriteAddr%s"%tc), \
+            comment="Final Offset Plus %uK"%((i * self.states.regCaps["maxLDSConstOffset"]) / 1024)))
 
     if needSwap:
       #fixme-iui  need to use wrapping increment for double or triple buffering:
@@ -8615,17 +8621,11 @@ class KernelWriterAssembly(KernelWriter):
               src1=sgpr("LocalWriteAddr%s"%tP["tensorChar"]), \
               comment="reset to Red"))
         else:
-          numLwa = 0
-          if tP["isA"]:
-            numLwa = self.states.a.numVgprLocalWriteAddr
-          elif tP["isB"]:
-            numLwa = self.states.b.numVgprLocalWriteAddr
-          for i in range(numLwa):
-            module.add(VAndB32(
-                dst=vgpr("LocalWriteAddr%s+%u"%(tP["tensorChar"], i)), \
-                src0=resetMask, \
-                src1=vgpr("LocalWriteAddr%s+%u"%(tP["tensorChar"], i)), \
-                comment="reset to Red"))
+          module.add(VAndB32(
+            dst=vgpr("LocalWriteAddr%s"%tc), \
+            src0=resetMask, \
+            src1=vgpr("LocalWriteAddr%s"%tc), \
+            comment="reset to Red"))
     if needMetaReset:
       if kernel["DirectToVgprSparseMetadata"]:
         tP["metadataWriteSwapByteOffset"] = 0
@@ -8660,13 +8660,26 @@ class KernelWriterAssembly(KernelWriter):
                                comment="Set LWA to first buffer offset"))
             self.vgprPool.checkIn(tmpvgpr)
         else:
-          numLwa = self.states.m.numVgprLocalWriteAddr
-          for i in range(numLwa):
-            module.add(VAndB32(
-                dst=vgpr("LocalWriteAddr%s+%u"%(tPM["tensorChar"], i)), \
-                src0=resetMask, \
-                src1=vgpr("LocalWriteAddr%s+%u"%(tPM["tensorChar"], i)), \
-                comment="reset to Red"))
+          module.add(VAndB32(
+            dst=vgpr("LocalWriteAddr%s+%u"%(tPM["tensorChar"], 0)), \
+            src0=resetMask, \
+            src1=vgpr("LocalWriteAddr%s+%u"%(tPM["tensorChar"], 0)), \
+            comment="reset to Red"))
+
+    numLwa = 0
+    if tP["isA"]:
+      numLwa = self.states.a.numVgprLocalWriteAddr
+    elif tP["isB"]:
+      numLwa = self.states.b.numVgprLocalWriteAddr
+    elif tP["isM"]:
+      numLwa = self.states.m.numVgprLocalWriteAddr
+
+    for i in range(1, numLwa):
+      module.add(VAddU32(
+        dst=vgpr("LocalWriteAddr%s+%u"%(tc, i)), \
+        src0=(i * self.states.regCaps["maxLDSConstOffset"]), \
+        src1=vgpr("LocalWriteAddr%s"%tc), \
+        comment="Final Offset Plus %uK"%((i * self.states.regCaps["maxLDSConstOffset"]) / 1024)))
     return module
 
   ##############################################################################
@@ -9456,6 +9469,7 @@ class KernelWriterAssembly(KernelWriter):
     if kernel["1LDSBuffer"] or ((tP["isA"] or tP["isB"]) and kernel["DirectToVgpr%s"%tc]): # no local read code if DirectToVgpr is enabled
       return Module("localReadSwapOffsets (Empty)")
     module = Module("localReadSwapOffsets")
+
     if internalPointerSwap or kernel["StoreSwapAddr"]:
       if not kernel["StoreSwapAddr"]:
         tP["localReadSwapByteOffset"] = 0 if tP["localReadSwapByteOffset"] else kernel["LdsOffsetA_Blk"]
@@ -9467,19 +9481,27 @@ class KernelWriterAssembly(KernelWriter):
           src1=vgpr("LocalReadAddr%s"%tc), \
           comment="swap Red Blk"))
     else:
-      numLra = 0
-      if tP["isA"]:
-        numLra = self.states.a.numVgprLocalReadAddr
-      elif tP["isB"]:
-        numLra = self.states.b.numVgprLocalReadAddr
-      elif tP["isM"]:
-        numLra = self.states.m.numVgprLocalReadAddr
-      for i in range(numLra):
-        module.add(VXorB32(
-            dst=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], i)), \
-            src0=hex(kernel["LdsOffsetA_Blk"]), \
-            src1=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], i)), \
-            comment="swap Red Blk"))
+      module.add(VXorB32(
+        dst=vgpr("LocalReadAddr%s"%tc), \
+        src0=hex(kernel["LdsOffsetA_Blk"]), \
+        src1=vgpr("LocalReadAddr%s"%tc), \
+        comment="swap Red Blk"))
+
+    numLra = 0
+    if tP["isA"]:
+      numLra = self.states.a.numVgprLocalReadAddr
+    elif tP["isB"]:
+      numLra = self.states.b.numVgprLocalReadAddr
+    elif tP["isM"]:
+      numLra = self.states.m.numVgprLocalReadAddr
+
+    for i in range(1,numLra):
+      module.add(VAddU32(
+        dst=vgpr("LocalReadAddr%s+%u"%(tc,i)), \
+        src0=(i * self.states.regCaps["maxLDSConstOffset"]), \
+        src1=vgpr("LocalReadAddr%s"%tc), \
+        comment="Final Offset Plus %uK"%((i * self.states.regCaps["maxLDSConstOffset"]) / 1024)))
+
     return module
 
   ##############################################################################
@@ -9512,19 +9534,28 @@ class KernelWriterAssembly(KernelWriter):
                       comment="Set LRA to first buffer offset"))
       self.vgprPool.checkIn(tmpvgpr)
     else:
-      numLra = 0
-      if tP["isA"]:
-        numLra = self.states.a.numVgprLocalReadAddr
-      elif tP["isB"]:
-        numLra = self.states.b.numVgprLocalReadAddr
-      elif tP["isM"]:
-        numLra = self.states.m.numVgprLocalReadAddr
-      for i in range(numLra):
-        module.add(VAndB32(
-            dst=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], i)), \
-            src0=hex(kernel["LdsOffsetA_Blk"]-1), \
-            src1=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], i)), \
-            comment="reset Red,Blk -> Red"))
+
+      module.add(VAndB32(
+        dst=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], 0)), \
+        src0=hex(kernel["LdsOffsetA_Blk"]-1), \
+        src1=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], 0)), \
+        comment="reset Red,Blk -> Red"))
+
+    numLra = 0
+    if tP["isA"]:
+      numLra = self.states.a.numVgprLocalReadAddr
+    elif tP["isB"]:
+      numLra = self.states.b.numVgprLocalReadAddr
+    elif tP["isM"]:
+      numLra = self.states.m.numVgprLocalReadAddr
+
+    for i in range(1,numLra):
+      module.add(VAddU32(
+        dst=vgpr("LocalReadAddr%s+%u"%(tc,i)), \
+        src0=(i * self.states.regCaps["maxLDSConstOffset"]), \
+        src1=vgpr("LocalReadAddr%s"%tc), \
+        comment="Final Offset Plus %uK"%((i * self.states.regCaps["maxLDSConstOffset"]) / 1024)))
+
     return module
 
   ##############################################################################
@@ -9546,12 +9577,17 @@ class KernelWriterAssembly(KernelWriter):
         numLra = self.states.b.numVgprLocalReadAddr
       elif tP["isM"]:
         numLra = self.states.m.numVgprLocalReadAddr
-      for i in range(numLra):
-        module.add(VAndB32(
-            dst=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], i)), \
-            src0=hex(kernel["LdsOffset%s_Blk"%tP["tensorChar"]]-1), \
-            src1=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], i)), \
-            comment="init Red,Blk -> Red"))
+      module.add(VAndB32(
+        dst=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], 0)), \
+        src0=hex(kernel["LdsOffset%s_Blk"%tP["tensorChar"]]-1), \
+        src1=vgpr("LocalReadAddr%s+%u"%(tP["tensorChar"], 0)), \
+        comment="init Red,Blk -> Red"))
+      for i in range(1, numLra):
+        module.add(VAddU32(
+          dst=vgpr("LocalReadAddr%s+%u"%(tc,i)), \
+          src0=(i * self.states.regCaps["maxLDSConstOffset"]), \
+          src1=vgpr("LocalReadAddr%s"%tc), \
+          comment="Final Offset Plus %uK"%((i * self.states.regCaps["maxLDSConstOffset"]) / 1024)))
     return module
 
   ##############################################################################
@@ -9903,7 +9939,7 @@ class KernelWriterAssembly(KernelWriter):
     module = Module("SrdTDInit")
     tmpspgr0 = self.sgprPool.checkOut(1)
     tmpspgr = self.sgprPool.checkOutAligned(2, 4, preventOverflow=False)
-    
+
     module.addComment0("calculate SrdTD address")
 
     module.add(SMovB32(dst=sgpr("SrdTD+3"), src="Srd127_96", comment="Set bits 127_96 in post-loop SRD"))
@@ -10217,6 +10253,8 @@ class KernelWriterAssembly(KernelWriter):
       self.vgprPool.checkIn(self.vgprs.storeRemapCoord0)
       self.vgprPool.checkIn(self.vgprs.storeRemapCoord1)
       self.vgprPool.checkIn(self.vgprs.storeRemapOffsetCoord1)
+      for v in self.vgprs.storeRemapAS:
+        self.vgprPool.checkIn(v)
     if kernel["BufferStore"]:
       self.vgprPool.checkIn(self.vgprs.cinRowPtr)
       self.vgprPool.checkIn(self.vgprs.coutRowPtrD)
@@ -10338,10 +10376,7 @@ class KernelWriterAssembly(KernelWriter):
     rpe = self.states.bpeCexternal / self.states.bpr
     rpv = rpe * gwvw
 
-    # num registers to check out
-    storeRegs = []
-    for i in range(0, nElements, gwvw):
-      storeRegs.append(self.vgprPool.checkOutAligned(int(rpv), int(rpv), "store element d"))
+    storeRegs = self.vgprs.storeRemapAS
     src = vgpr(self.vgprs.storeRemapLR)
     for rIdx, i in enumerate(range(0, nElements, gwvw)):
       offset = self.storeRemapLrOffset * bpe * (i//gwvw)
@@ -10446,8 +10481,6 @@ class KernelWriterAssembly(KernelWriter):
 
     module.addSpaceLine()
     self.vgprPool.checkIn(vTmp)
-    for v in storeRegs:
-      self.vgprPool.checkIn(v)
 
     #Data exchange between different waves
     #Make sure LDS reads are finished of all waves
@@ -10592,6 +10625,12 @@ class KernelWriterAssembly(KernelWriter):
 
       self.vgprPool.checkIn(tmpV0)
 
+      nElements = kernel["MacroTile0"]*kernel["MatrixInstN"]//kernel["MIWaveGroup"][0]//self.states.kernel["WavefrontSize"]
+      rpe = self.states.bpeCexternal / self.states.bpr
+      rpv = rpe * gwvw
+      self.vgprs.storeRemapAS = []
+      for i in range(0, nElements, gwvw):
+        self.vgprs.storeRemapAS.append(self.vgprPool.checkOutAligned(int(rpv), int(rpv), "store element d"))
     return module
 
   ##############################################################################
@@ -10871,7 +10910,7 @@ class KernelWriterAssembly(KernelWriter):
         module.add(skipSrdTDLabel)
       else:
         module.add(SCBranchSCC1(labelName=gsuLabel.getLabelName(), comment="branch if GSU == 1"))
-    
+
     gsuLimitRange = range(0, gsuLimit) # generate GSU1 and GSUM label
     # TODO: generate only GSUM label for MBSK
     # if (kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel'):
@@ -11052,7 +11091,7 @@ class KernelWriterAssembly(KernelWriter):
             name = self.labels.getNameInc("Load_Bias%s_%u"%(i.toNameAbbrev(), factorDims[d]))
             multiBiasTypeLabel.append(Label(name, ""))
           multiBiasTypeLabel.append(loadBiasEndLabel)
-          offsetVgpr  = self.vgprPool.checkOut(1, 1)
+          offsetVgpr  = self.vgprPool.checkOut(1)
           with self.allocTmpSgpr(4, 1) as tmpSgprRes:
             if len(kernel["ProblemType"]["BiasDataTypeList"]) == 1:
               vectorDataTypes.bias(d).dataType = kernel["ProblemType"]["BiasDataTypeList"][0]
@@ -11118,7 +11157,7 @@ class KernelWriterAssembly(KernelWriter):
           tile01 = tP["tile01Idx"]
           mt     = kernel["MacroTile%u" % tile01]
           gwvw   = min(max(mt // kernel["NumThreads"], kernel["VectorWidthA"]), tP["glvw"])
-          offsetVgpr  = self.vgprPool.checkOut(gwvw, 1)
+          offsetVgpr  = self.vgprPool.checkOut(gwvw)
           with self.allocTmpSgpr(5, 2) as tmpSgprRes:
             if kernel["GlobalSplitU"] > 1 or kernel["GlobalSplitU"] == -1:
               module.add(self.writeBiasToGlobal(kernel["ProblemType"]["ComputeDataType"], kernel, tP, gwvw, offsetVgpr, tmpSgprRes, tmpVgprRes))
@@ -11153,7 +11192,7 @@ class KernelWriterAssembly(KernelWriter):
           totalTmpVgpr = self.getNumOfTempVgprs(vectorDataTypes, kernel, 1, factorDims[d])
           tmpVgpr      = self.vgprPool.checkOutAligned(totalTmpVgpr, 2, "store tmps")
           tmpVgprRes   = ContinuousRegister(idx=tmpVgpr, size=4)
-          offsetVgpr  = self.vgprPool.checkOut(1, 1)
+          offsetVgpr  = self.vgprPool.checkOut(1)
           with self.allocTmpSgpr(3, 1) as tmpSgprRes:
             if d == 1:
               module.add(factorDim1Label)
@@ -11398,8 +11437,8 @@ class KernelWriterAssembly(KernelWriter):
       toActModuleList = None
       isInsertActFunctionCallAddrCalc = True
       if kernel["ActivationFuncCall"]:
-        sgprOffsetActivation = self.sgprPool.checkOutAligned(2, 2, preventOverflow=0)
-        sgprOffsetBack = self.sgprPool.checkOutAligned(2, 2, preventOverflow=0)
+        sgprOffsetActivation = self.sgprPool.checkOutAligned(2, 2, preventOverflow=False)
+        sgprOffsetBack = self.sgprPool.checkOutAligned(2, 2, preventOverflow=False)
         activationSetPCStruct = self.ActivationSetPCStruct(sgprOffsetActivation=sgprOffsetActivation, \
           sgprOffsetBack=sgprOffsetBack, vgprActCopy=tmpVgpr.idx)
         activationCDataType = kernel["ProblemType"]["ActivationComputeDataType"]
@@ -11436,14 +11475,15 @@ class KernelWriterAssembly(KernelWriter):
       if (kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel'):
         reductionStartLabel = Label(self.labels.getNameInc("Reduction_Start"), comment="Reduction start")
         reductionEndLabel = Label(self.labels.getNameInc("Reduction_End"), comment="Reduction end")
-        with self.allocTmpSgpr(1) as tmpSgprGSU:
-          module.addComment1("cases with GSU>1 need reduction")
-          module.add(SAndB32(dst=sgpr(tmpSgprGSU.idx), src0=sgpr("GSU"), src1=hex(0x3FFF), comment="Restore GSU"))
-          module.add(SCmpEQU32(src0=sgpr(tmpSgprGSU.idx), src1=1, comment="GSU == 1 ?"))
-        module.add(SCBranchSCC0(labelName=reductionStartLabel.getLabelName(), comment="branch if GSU != 1"))
-        module.add(SMovB64(dst=sgpr("SrdTD+0", 2), src=sgpr("SrdD+0", 2), comment="SrdTD = SrdD for GSU == 1"))
-        module.add(SMovB64(dst=sgpr("SrdTD+2", 2), src=sgpr("SrdD+2", 2), comment="SrdTD = SrdD for GSU == 1"))
-        module.add(SBranch(labelName=reductionEndLabel.getLabelName(), comment="branch if GSU == 1"))
+        # TODO: enabled when only GSUM label for MBSKGSU1
+        # with self.allocTmpSgpr(1) as tmpSgprGSU:
+        #   module.addComment1("cases with GSU>1 need reduction")
+        #   module.add(SAndB32(dst=sgpr(tmpSgprGSU.idx), src0=sgpr("GSU"), src1=hex(0x3FFF), comment="Restore GSU"))
+        #   module.add(SCmpEQU32(src0=sgpr(tmpSgprGSU.idx), src1=1, comment="GSU == 1 ?"))
+        # module.add(SCBranchSCC0(labelName=reductionStartLabel.getLabelName(), comment="branch if GSU != 1"))
+        # module.add(SMovB64(dst=sgpr("SrdTD+0", 2), src=sgpr("SrdD+0", 2), comment="SrdTD = SrdD for GSU == 1"))
+        # module.add(SMovB64(dst=sgpr("SrdTD+2", 2), src=sgpr("SrdD+2", 2), comment="SrdTD = SrdD for GSU == 1"))
+        # module.add(SBranch(labelName=reductionEndLabel.getLabelName(), comment="branch if GSU == 1"))
         
       gsuComponent = Component.GSU.find(self)
       if kernel["GlobalSplitU"] > 1 and kernel["GlobalSplitUAlgorithm"] == "MultipleBufferSingleKernel":
@@ -11451,6 +11491,8 @@ class KernelWriterAssembly(KernelWriter):
         module.add(gsuComponent.reductionBranches(self, kernel, tPB, vectorWidths_1, elements_1, tmpVgpr, cvtVgprStruct, \
           vectorDataTypes, factorDims, endLabel))
         module.add(reductionEndLabel)
+        module.add(self.undefineSgpr("GSUStartWGIdx"))
+        module.addSpaceLine()
 
 
       betaModules = Module("Betas")
@@ -11514,17 +11556,6 @@ class KernelWriterAssembly(KernelWriter):
       # Check if branch exceeds
       if False in betas and True in betas:
         isBetaLongBranch = False
-        def findInstCount(module, targetItem, count):
-          for inst in module.items():
-            if isinstance(inst, Module):
-              count, found = findInstCount(inst, targetItem, count)
-              if found:
-                return count, True
-            elif (inst is targetItem):
-              return count, True
-            elif (not isinstance(inst, TextBlock)):
-              count += 1
-          return count, False
         count = 0
         count, found = findInstCount(betaModules, betaLabel, count)
         if found:
@@ -11579,7 +11610,7 @@ class KernelWriterAssembly(KernelWriter):
       if gsuLimit > 1 and gsuLimitIdx == 0:
         with self.allocTmpSgpr(3) as tmpSgprInfo:
           module.add(SLongBranchPositive(Label("KernelEnd", ""), tmpSgprInfo))
-          
+
     kernel["GlobalSplitU"] = gsuBackup
     kernel["_GlobalAccumulation"] = gsuAccumBackup
     self.states.bpeCexternal = bpeCexternalBackup
@@ -11593,6 +11624,142 @@ class KernelWriterAssembly(KernelWriter):
       GSUtotal = int(GSUtotal/int((kernel["MIWaveTile"][0] * kernel["MIWaveTile"][1]) * (kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1])/8))
     GSUtotal = max(2,GSUtotal)
     return GSUtotal
+
+  def setOccupancy(self, kernel):
+    # Use VGPR up to next occupancy threshold:
+    maxVgprs, occupancy = self.getMaxRegsForOccupancy(kernel["NumThreads"], self.vgprPool.size(), self.sgprPool.size(), \
+                                                      self.getLdsSize(kernel), self.agprPool.size(), self.states.doubleVgpr)
+    # Set occupancy limit for register pools
+    # TODO: Support gfx12
+    if kernel["ISA"][0] != 12:
+      self.vgprPool.setOccupancyLimit(self.states.regCaps["MaxVgpr"], self.states.regCaps["PhysicalMaxVgpr"] // occupancy)
+      self.sgprPool.setOccupancyLimit(self.states.regCaps["MaxSgpr"], self.states.regCaps["PhysicalMaxSgpr"] // occupancy)
+    return maxVgprs, occupancy
+
+  def refineOccupancy(self, kernel, atomic, elements, actPCMaxTempSgpr, \
+                      edgeI, gwvw, maxVgprs, ss):
+    # Get estimated numVgprAvailable
+    # print("Max vgprs =", maxVgprs, self.vgprPool.size(), self.vgprPool.availableBlock(ss.numVgprsPerElement, ss.align))
+    numVgprAvailable = self.vgprPool.availableBlockMaxVgpr(maxVgprs, ss.numVgprsPerElement, ss.align)
+
+    # Grow the register pool if needed - we need enough regs for at least one element
+    # Unfortunate since this means the write logic is setting the VGPR requirement
+    # for the entire kernel but at least we have a functional kernel.
+    # Before growing the pool, see if we can shrink the write vector width instead?
+    # TODO : the vgprSerial is needed for-ever and if we grow here will split the
+    # range of the tmps.  Maybe want to move vgprSerial to first vgpr?
+
+    # TODO: Minimum elems for StoreRemap
+    # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
+    minElements = 2 if (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()) else 1
+    if numVgprAvailable < minElements*ss.numVgprsPerElement:
+      self.vgprPool.resetOccupancyLimit()
+      print2("info: growing pool += %d * %d for GlobalWrite\n" \
+          % (minElements,ss.numVgprsPerElement))
+      self.vgprPool.growPool(0, minElements, ss.numVgprsPerElement, \
+        "grow-pool for GlobalWrite")
+      maxVgprsN, occupancy = self.setOccupancy(kernel)
+      if maxVgprs != maxVgprsN:
+        #print("refineOccupancy maxVgprs, new", maxVgprsN, "old", maxVgprs)
+        return self.refineOccupancy(kernel, atomic, elements, actPCMaxTempSgpr, edgeI, gwvw, maxVgprsN, ss)
+      numVgprAvailable = self.vgprPool.available()
+
+    # print("NumVgprAvailable", numVgprAvailable)
+    if ss.numVgprsPerElement:
+      numElementsPerBatch = numVgprAvailable // ss.numVgprsPerElement
+    else:
+      numElementsPerBatch = len(elements[edgeI]) # max, do 'em all
+
+    assert(self.states.c.numVgprValu % gwvw == 0) # sanity check
+
+    numElementsPerBatch = numElementsPerBatch if not kernel["NumElementsPerBatchStore"] else min(kernel["NumElementsPerBatchStore"],numElementsPerBatch)
+
+    # print("NumElementsPerBatch=", numElementsPerBatch, "LimitedBySgprs=", ss.cfg.numElementsPerBatchLimitedBySgprs, \
+    #     "WARNING" if ss.cfg.numElementsPerBatchLimitedBySgprs < numElementsPerBatch else "okay")
+    if ss.cfg.numElementsPerBatchLimitedBySgprs < numElementsPerBatch:
+      numElementsPerBatch = ss.cfg.numElementsPerBatchLimitedBySgprs
+
+    # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
+    if (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()):
+      # only do an even number of halves - since these share hi/lo pieces of some registers?
+      if numElementsPerBatch > 1:
+        numElementsPerBatch = int(numElementsPerBatch/2)*2
+      # dot2: no this constraint
+      elif not kernel["EnableMatrixInstruction"] and not kernel["UseDotInstruction"]:
+        # The globalWriteBatch routine below can't handle odd elements per batch
+        # and 0 elements per batch is illegal.
+        # so if we don't have *GPR resources to handle a larger batch then need
+        # to mark overflowedResources rather than generate a kernel that won't work.
+        # It might be possible to fix globalWriteBatch to handle this case but these
+        # are likely to be low-performing so likely not worth optimizing.
+        print2("WARNING: half requires at least two elements per batch")
+        self.states.overflowedResources = 3
+
+    assert numElementsPerBatch > 0, "numElementsPerBatch=0 for %s"%self.states.kernelName
+
+    #numElementsPerBatch=min(2,numElementsPerBatch) # hack to control number of batches
+    if atomic and (ss.optSingleColVgpr or ss.optSharedColVgpr):
+      # hack to avoid re-using address vgpr across rows
+      # atomics need to perform several memory operations
+      # if the batch spans multiple rows, need multiple address vgpr
+      # which is not currently supported in the two opt*ColVgpr modes
+      firstRow = [e for e in elements[edgeI] if e[0]==0 and e[2]==0]
+      numElementsPerBatch=min(len(firstRow),numElementsPerBatch)
+
+    # check best numElementsPerBatch to handle a column block
+    # elements of column block must be multiple size of numElementsPerBatch
+    nBatchesPerRow = 0
+    if kernel["StoreRemapVectorWidth"]:
+      firstRow = [e for e in elements[edgeI] if e[0]==0 and e[2]==0] # format for element = (tt1, tt0, vc1, vc0)
+      # find the largest factor and smaller than numElementPerBatch
+      nBatchesPerRow = 1
+      for d in range(1, len(firstRow)+1):
+        largestFactor = len(firstRow)//d
+        if len(firstRow)%d == 0 and largestFactor <= numElementsPerBatch:
+          numElementsPerBatch = largestFactor
+          nBatchesPerRow = d
+          break
+
+    # if no atomics and no edge, then write whole vectors
+    #if not atomic and not edge:
+    #  numVectorsPerBatch = numElementsPerBatch / kernel["GlobalWriteVectorWidth"]
+    #  #print "  NumVectorsPerBatch", numVectorsPerBatch
+    #  numElementsPerBatch = numVectorsPerBatch * kernel["GlobalWriteVectorWidth"]
+    numBatches = max(1, ceilDivide(len(elements[edgeI]),numElementsPerBatch))
+
+    # Grow pool if needed
+    # Get true numVgprAvailable
+    numVgprAvailable = self.vgprPool.availableBlock(ss.numVgprsPerElement, ss.align)
+    totalNeededVgpr = ss.numVgprsPerElement * numElementsPerBatch
+    # print("Available vgprs =", numVgprAvailable, "Needed vgprs =", totalNeededVgpr, "pool size =", self.vgprPool.size())
+    if numVgprAvailable < totalNeededVgpr:
+      self.vgprPool.resetOccupancyLimit()
+      print2("info: growing pool += %d * %d for GlobalWrite\n" \
+          % (numBatches,ss.numVgprsPerElement))
+      availableBlock = min(0, self.vgprPool.available() - numVgprAvailable)
+      self.vgprPool.growPool(0, totalNeededVgpr + availableBlock, 1, "grow-pool for GlobalWrite")
+      maxVgprsN, occupancy = self.setOccupancy(kernel)
+      if maxVgprs != maxVgprsN:
+        #print("refineOccupancy maxVgprs, new", maxVgprsN, "old", maxVgprs)
+        return self.refineOccupancy(kernel, atomic, elements, actPCMaxTempSgpr, edgeI, gwvw, maxVgprsN, ss)
+  
+    # # Get true numVgprAvailable
+    # numVgprAvailable = self.vgprPool.availableBlock(ss.numVgprsPerElement, ss.align)
+    # print("Available vgprs =", numVgprAvailable, "pool size =", self.vgprPool.size())
+
+    numSgprs = ss.cfg.numTempSgprPerBatch + ss.cfg.numMaskSgprPerBatch + ss.cfg.numMaskSgprPerElement * numElementsPerBatch
+
+    if actPCMaxTempSgpr:
+      numSgprs = max(actPCMaxTempSgpr, numSgprs)
+
+    self.sgprPool.resetOccupancyLimit()
+    self.sgprPool.checkIn(self.sgprPool.checkOutAligned(numSgprs, 2, preventOverflow=False))
+    maxVgprsN, occupancy = self.setOccupancy(kernel)
+    if maxVgprs != maxVgprsN:
+      #print("refineOccupancy maxVgprs, new", maxVgprsN, "old", maxVgprs)
+      return self.refineOccupancy(kernel, atomic, elements, actPCMaxTempSgpr, edgeI, gwvw, maxVgprsN, ss)
+    return numElementsPerBatch, nBatchesPerRow, numBatches, numSgprs
+    
 
   ##############################################################################
   # globalWriteElementBatch :
@@ -11651,127 +11818,21 @@ class KernelWriterAssembly(KernelWriter):
     if tmpVgprDynamicSize > 0:
       tmpVgprDynamic = ContinuousRegister(idx=self.vgprPool.checkOutAligned(tmpVgprDynamicSize, tmpVgprDynamicAlign), size=tmpVgprDynamicSize)
 
+    maxVgprs, occupancy = self.setOccupancy(kernel)
+
     ss = StoreState(self, kernel, gwvw, edge, beta, atomic, elements[edgeI], vectorDataTypes, dim=factorDim)
 
-    def setOccupancy():
-      # Use VGPR up to next occupancy threshold:
-      maxVgprs, occupancy = self.getMaxRegsForOccupancy(kernel["NumThreads"], self.vgprPool.size(), self.sgprPool.size(), \
-                                                        self.getLdsSize(kernel), self.agprPool.size(), self.states.doubleVgpr)
-      # Set occupancy limit for register pools
-      # TODO: Support gfx12
-      if kernel["ISA"][0] != 12:
-        self.vgprPool.setOccupancyLimit(self.states.regCaps["MaxVgpr"], self.states.regCaps["PhysicalMaxVgpr"] // occupancy)
-        self.sgprPool.setOccupancyLimit(self.states.regCaps["MaxSgpr"], self.states.regCaps["PhysicalMaxSgpr"] // occupancy)
-      return maxVgprs, occupancy
+    actPCMaxTempSgpr_ = None
+    if activationLabelList and isInsertActFunctionCallAddrCalc:
+      assert activationSetPCStruct, activationEnumStrList and activationLabelList and toActModuleList
+      actPCMaxTempSgpr_ = actPCMaxTempSgpr
 
-    maxVgprs, occupancy = setOccupancy()
-    # Get estimated numVgprAvailable
-    # print("Max vgprs =", maxVgprs, self.vgprPool.size(), self.vgprPool.availableBlock(ss.numVgprsPerElement, ss.align))
-    numVgprAvailable = self.vgprPool.availableBlockMaxVgpr(maxVgprs, ss.numVgprsPerElement, ss.align)
-
-    # Grow the register pool if needed - we need enough regs for at least one element
-    # Unfortunate since this means the write logic is setting the VGPR requirement
-    # for the entire kernel but at least we have a functional kernel.
-    # Before growing the pool, see if we can shrink the write vector width instead?
-    # TODO : the vgprSerial is needed for-ever and if we grow here will split the
-    # range of the tmps.  Maybe want to move vgprSerial to first vgpr?
-
-    # TODO: Minimum elems for StoreRemap
-    # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
-    minElements = 2 if (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()) else 1
-    if numVgprAvailable < minElements*ss.numVgprsPerElement:
-      self.vgprPool.resetOccupancyLimit()
-      print2("info: growing pool += %d * %d for GlobalWrite\n" \
-          % (minElements,ss.numVgprsPerElement))
-      self.vgprPool.growPool(0, minElements, ss.numVgprsPerElement, \
-        "grow-pool for GlobalWrite")
-      maxVgprs, occupancy = setOccupancy()
-      numVgprAvailable = self.vgprPool.available()
+    numElementsPerBatch, nBatchesPerRow, numBatches, numSgprs = self.refineOccupancy(kernel, atomic, elements, actPCMaxTempSgpr_, edgeI, gwvw, maxVgprs, ss)
 
     # set atomicW after we potentially resize GWVW
     atomicW = min(gwvw, self.getVectorAtomicWidth(kernel))
 
-    # print("NumVgprAvailable", numVgprAvailable)
-    if ss.numVgprsPerElement:
-      numElementsPerBatch = numVgprAvailable // ss.numVgprsPerElement
-    else:
-      numElementsPerBatch = len(elements[edgeI]) # max, do 'em all
-
-    assert(self.states.c.numVgprValu % gwvw == 0) # sanity check
-
-    numElementsPerBatch = numElementsPerBatch if not kernel["NumElementsPerBatchStore"] else min(kernel["NumElementsPerBatchStore"],numElementsPerBatch)
-
-    # print("NumElementsPerBatch=", numElementsPerBatch, "LimitedBySgprs=", ss.cfg.numElementsPerBatchLimitedBySgprs, \
-    #     "WARNING" if ss.cfg.numElementsPerBatchLimitedBySgprs < numElementsPerBatch else "okay")
-    if ss.cfg.numElementsPerBatchLimitedBySgprs < numElementsPerBatch:
-      numElementsPerBatch = ss.cfg.numElementsPerBatchLimitedBySgprs
-
-    # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
-    if (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()):
-      # only do an even number of halves - since these share hi/lo pieces of some registers?
-      if numElementsPerBatch > 1:
-        numElementsPerBatch = int(numElementsPerBatch/2)*2
-      # dot2: no this constraint
-      elif not kernel["EnableMatrixInstruction"] and not kernel["UseDotInstruction"]:
-        # The globalWriteBatch routine below can't handle odd elements per batch
-        # and 0 elements per batch is illegal.
-        # so if we don't have *GPR resources to handle a larger batch then need
-        # to mark overflowedResources rather than generate a kernel that won't work.
-        # It might be possible to fix globalWriteBatch to handle this case but these
-        # are likely to be low-performing so likely not worth optimizing.
-        print2("WARNING: half requires at least two elements per batch")
-        self.states.overflowedResources = 3
-
-    assert numElementsPerBatch > 0, "numElementsPerBatch=0 for %s"%self.states.kernelName
-
-    #numElementsPerBatch=min(2,numElementsPerBatch) # hack to control number of batches
-    if atomic and (ss.optSingleColVgpr or ss.optSharedColVgpr):
-      # hack to avoid re-using address vgpr across rows
-      # atomics need to perform several memory operations
-      # if the batch spans multiple rows, need multiple address vgpr
-      # which is not currently supported in the two opt*ColVgpr modes
-      firstRow = [e for e in elements[edgeI] if e[0]==0 and e[2]==0]
-      numElementsPerBatch=min(len(firstRow),numElementsPerBatch)
-
-    # check best numElementsPerBatch to handle a column block
-    # elements of column block must be multiple size of numElementsPerBatch
-    if kernel["StoreRemapVectorWidth"]:
-      firstRow = [e for e in elements[edgeI] if e[0]==0 and e[2]==0] # format for element = (tt1, tt0, vc1, vc0)
-      # find the largest factor and smaller than numElementPerBatch
-      nBatchesPerRow = 1
-      for d in range(1, len(firstRow)+1):
-        largestFactor = len(firstRow)//d
-        if len(firstRow)%d == 0 and largestFactor <= numElementsPerBatch:
-          numElementsPerBatch = largestFactor
-          nBatchesPerRow = d
-          break
-
-    # if no atomics and no edge, then write whole vectors
-    #if not atomic and not edge:
-    #  numVectorsPerBatch = numElementsPerBatch / kernel["GlobalWriteVectorWidth"]
-    #  #print "  NumVectorsPerBatch", numVectorsPerBatch
-    #  numElementsPerBatch = numVectorsPerBatch * kernel["GlobalWriteVectorWidth"]
-    numBatches = max(1, ceilDivide(len(elements[edgeI]),numElementsPerBatch))
-
-    # Grow pool if needed
-    # Get true numVgprAvailable
-    numVgprAvailable = self.vgprPool.availableBlock(ss.numVgprsPerElement, ss.align)
-    totalNeededVgpr = ss.numVgprsPerElement * numElementsPerBatch
-    # print("Available vgprs =", numVgprAvailable, "Needed vgprs =", totalNeededVgpr, "pool size =", self.vgprPool.size())
-    if numVgprAvailable < totalNeededVgpr:
-      print2("info: growing pool += %d * %d for GlobalWrite\n" \
-          % (numBatches,ss.numVgprsPerElement))
-      availableBlock = min(0, self.vgprPool.available() - numVgprAvailable)
-      self.vgprPool.growPool(0, totalNeededVgpr + availableBlock, 1, "grow-pool for GlobalWrite")
-    # # Get true numVgprAvailable
-    # numVgprAvailable = self.vgprPool.availableBlock(ss.numVgprsPerElement, ss.align)
-    # print("Available vgprs =", numVgprAvailable, "pool size =", self.vgprPool.size())
-
-    numSgprs = ss.cfg.numTempSgprPerBatch + ss.cfg.numMaskSgprPerBatch + ss.cfg.numMaskSgprPerElement * numElementsPerBatch
-
     if activationLabelList and isInsertActFunctionCallAddrCalc:
-      assert activationSetPCStruct, activationEnumStrList and activationLabelList and toActModuleList
-      numSgprs = max(actPCMaxTempSgpr, numSgprs)
       edgeModule.add(self.insertActFunctionCallAddrCalc(activationSetPCStruct.sgprOffsetActivation, \
         gwvw, toActModuleList, activationEnumStrList, activationLabelList, \
         idx0, idx1))
